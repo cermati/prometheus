@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"text/template"
 
 	"github.com/grafana/regexp"
 	"github.com/prometheus/common/model"
@@ -87,6 +88,8 @@ type Config struct {
 	Separator string `yaml:"separator,omitempty"`
 	// Regex against which the concatenation is matched.
 	Regex Regexp `yaml:"regex,omitempty"`
+	// Regex pattern with text/template support
+	RegexTemplate string `yaml:"regex_template,omitempty"`
 	// Modulus to take of the hash of concatenated values from the source labels.
 	Modulus uint64 `yaml:"modulus,omitempty"`
 	// TargetLabel is the label to which the resulting string is written in a replacement.
@@ -237,13 +240,36 @@ func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
 	}
 	val := strings.Join(values, cfg.Separator)
 
+	re := cfg.Regex
+
+	// Render and compile cfg.RegexTemplate if specified. On this PoC,
+	// render & compilation errors are ignored.
+	if cfg.RegexTemplate != "" {
+		regexTemplate, err := template.New("relabel").Parse(cfg.RegexTemplate)
+		if err == nil {
+			labelValues := map[string]string{}
+			lb.Range(func(l labels.Label) {
+				labelValues[l.Name] = l.Value
+			})
+
+			regexRenderedStrBuf := new(strings.Builder)
+			err := regexTemplate.Execute(regexRenderedStrBuf, labelValues)
+			if err == nil {
+				re2, err := regexp.Compile(regexRenderedStrBuf.String())
+				if err == nil {
+					re = Regexp{re2}
+				}
+			}
+		}
+	}
+
 	switch cfg.Action {
 	case Drop:
-		if cfg.Regex.MatchString(val) {
+		if re.MatchString(val) {
 			return false
 		}
 	case Keep:
-		if !cfg.Regex.MatchString(val) {
+		if !re.MatchString(val) {
 			return false
 		}
 	case DropEqual:
@@ -255,17 +281,17 @@ func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
 			return false
 		}
 	case Replace:
-		indexes := cfg.Regex.FindStringSubmatchIndex(val)
+		indexes := re.FindStringSubmatchIndex(val)
 		// If there is no match no replacement must take place.
 		if indexes == nil {
 			break
 		}
-		target := model.LabelName(cfg.Regex.ExpandString([]byte{}, cfg.TargetLabel, val, indexes))
+		target := model.LabelName(re.ExpandString([]byte{}, cfg.TargetLabel, val, indexes))
 		if !target.IsValid() {
 			lb.Del(cfg.TargetLabel)
 			break
 		}
-		res := cfg.Regex.ExpandString([]byte{}, cfg.Replacement, val, indexes)
+		res := re.ExpandString([]byte{}, cfg.Replacement, val, indexes)
 		if len(res) == 0 {
 			lb.Del(cfg.TargetLabel)
 			break
@@ -282,20 +308,20 @@ func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
 		lb.Set(cfg.TargetLabel, fmt.Sprintf("%d", mod))
 	case LabelMap:
 		lb.Range(func(l labels.Label) {
-			if cfg.Regex.MatchString(l.Name) {
-				res := cfg.Regex.ReplaceAllString(l.Name, cfg.Replacement)
+			if re.MatchString(l.Name) {
+				res := re.ReplaceAllString(l.Name, cfg.Replacement)
 				lb.Set(res, l.Value)
 			}
 		})
 	case LabelDrop:
 		lb.Range(func(l labels.Label) {
-			if cfg.Regex.MatchString(l.Name) {
+			if re.MatchString(l.Name) {
 				lb.Del(l.Name)
 			}
 		})
 	case LabelKeep:
 		lb.Range(func(l labels.Label) {
-			if !cfg.Regex.MatchString(l.Name) {
+			if !re.MatchString(l.Name) {
 				lb.Del(l.Name)
 			}
 		})
